@@ -13,21 +13,21 @@ BEGIN {
     @ISA = qw(Exporter);
 }
 
-@EXPORT = @EXPORT_OK = qw(try catch_when catch_default finally);
+@EXPORT = @EXPORT_OK = qw(try catch_when catch_default then finally);
 
 $Carp::Internal{+__PACKAGE__}++;
 
 =head1 NAME
 
-Try::Tiny::SmartCatch - Try::Tiny with some additional features
+Try::Tiny::SmartCatch - lightweight Perl module for powerful exceptions handling
 
 =head1 VERSION
 
-Version 0.2
+Version 0.3
 
 =cut
 
-$VERSION = '0.2';
+$VERSION = '0.3';
 
 =head1 SYNOPSIS
 
@@ -75,6 +75,18 @@ $VERSION = '0.2';
         # and finally run some other code
     };
 
+    # try some code, and execute the other if it pass
+    try sub {
+        say 'some code';
+        return 'Hello, world!';
+    },
+    catch_default sub {
+        say 'some exception caught: ', $_;
+    },
+    then sub {
+        say 'all passed, no exceptions found. Message from try block: ' . $_[0];
+    };
+
 =head1 DESCRIPTION
 
 C<Try::Tiny::SmartCatch> is a simple way to handle exceptions. It's mostly a copy
@@ -86,6 +98,8 @@ This gave you less chances to forgot that C<return> statement exits just from ex
 handler, not surrounding function call.
 
 If you want to read about other assumptions, read about our predecessor: L<Try::Tiny>.
+
+More documentation for C<Try::Tiny::SmartCatch> is at package home: L<http://github.com/mysz/try-tiny-smartcatch>
 
 =head1 EXPORT
 
@@ -108,11 +122,7 @@ The only difference is that here must be given evident sub reference, not anonym
 sub try ($;@) {
     my ( $try, @code_refs ) = @_;
 
-    # we need to save this here, the eval block will be in scalar context due
-    # to $failed
-    my $wantarray = wantarray;
-
-    my ( @catch_when, $catch_default, @finally );
+    my ( @catch_when, $catch_default, $then, @finally );
 
     # find labeled blocks in the argument list.
     # catch and finally tag the blocks by blessing a scalar reference to them.
@@ -125,10 +135,15 @@ sub try ($;@) {
             push (@catch_when, map { [ $_, $$code_ref{code}, ] } (@{$code_ref->get_types}));
         }
         elsif ($ref eq 'Try::Tiny::SmartCatch::Catch::Default') {
-            $catch_default //= $$code_ref{code};
+            $catch_default = $$code_ref{code}
+                if (!defined ($catch_default));
         }
         elsif ($ref eq 'Try::Tiny::SmartCatch::Finally') {
             push (@finally, ${$code_ref});
+        }
+        elsif ($ref eq 'Try::Tiny::SmartCatch::Then') {
+            $then = ${$code_ref}
+                if (!defined ($then));
         }
         else {
             require Carp;
@@ -155,16 +170,7 @@ sub try ($;@) {
         $failed = not eval {
             $@ = $prev_error;
 
-            # evaluate the try block in the correct context
-            if ( $wantarray ) {
-                @ret = $try->();
-            }
-            elsif ( defined $wantarray ) {
-                $ret[0] = $try->();
-            }
-            else {
-                $try->();
-            };
+            @ret = $try->();
 
             return 1; # properly set $fail to false
         };
@@ -184,7 +190,7 @@ sub try ($;@) {
     if ($failed) {
         # if we got an error, invoke the catch block.
         if (scalar (@catch_when) || $catch_default) {
-            my ($catch_data, $catched, );
+            my ($catch_data, );
 
             # This works like given($error), but is backwards compatible and
             # sets $_ in the dynamic scope for the body of C<$catch>
@@ -215,8 +221,11 @@ sub try ($;@) {
         return;
     }
     else {
+        @ret = $then->(@ret)
+            if ($then);
+
         # no failure, $@ is back to what it was, everything is fine
-        return $wantarray ? @ret : $ret[0];
+        return wantarray ? @ret : $ret[0];
     }
 }
 
@@ -297,10 +306,40 @@ sub catch_default ($;@) {
     return $catch, @_;
 }
 
+=head2 then ($;@)
+
+C<then> block is executed after C<try> clause, if none of C<catch_when> or
+C<catch_default> blocks was executed (it means, if no exception occured).
+It;s executed before C<finally> blocks.
+
+    try sub {
+        # some code
+    },
+    catch_when 'MyException' => sub {
+        say 'caught MyException exception';
+    },
+    then sub {
+        say 'No exception was raised';
+    },
+    finally sub {
+        say 'executed always';
+    };
+
+=cut
+
+sub then ($;@) {
+    my ($block, @rest, ) = @_;
+
+    return (
+        bless (\$block, 'Try::Tiny::SmartCatch::Then'),
+        @rest
+    );
+}
+
 =head2 finally ($;@)
 
-Works exactly like L<Try::Tiny> C<finally> function (OK, again, evident sub
-instead of anonymous):
+Works exactly like L<Try::Tiny> C<finally> function (OK, again, explicit sub
+instead of implicit):
 
     try sub {
         # some code
@@ -363,7 +402,7 @@ package Try::Tiny::SmartCatch::Catch::When;
 
     sub get_types {
         my ($self, ) = @_;
-        return wantarray ? @{$$self{types} // []} : $$self{types};
+        return wantarray ? @{defined ($$self{types}) ? $$self{types} : []} : $$self{types};
     }
 }
 
@@ -371,9 +410,13 @@ package Try::Tiny::SmartCatch::Catch::When;
 
 =over 4
 
+=item L<https://github.com/mysz/try-tiny-smartcatch>
+
+Try::Tiny::SmartCatch home.
+
 =item L<Try::Tiny>
 
-Minimal try/catch with proper localization of $@, base of L<Try::Catch::SmartCatch>
+Minimal try/catch with proper localization of $@, base of L<Try::Tiny::SmartCatch>
 
 =item L<TryCatch>
 
@@ -388,7 +431,7 @@ Marcin Sztolcman, C<< <marcin at urzenia.net> >>
 =head1 BUGS
 
 Please report any bugs or feature requests through the web interface at
-L<https://github.com/mysz/try-tiny-smartcatch/issues>.
+L<http://github.com/mysz/try-tiny-smartcatch/issues>.
 
 =head1 SUPPORT
 
@@ -402,11 +445,11 @@ You can also look for information at:
 
 =item * Try::Tiny::SmartCatch home & source code
 
-L<https://github.com/mysz/try-tiny-smartcatch>
+L<http://github.com/mysz/try-tiny-smartcatch>
 
 =item * Issue tracker (report bugs here)
 
-L<https://github.com/mysz/try-tiny-smartcatch/issues>
+L<http://github.com/mysz/try-tiny-smartcatch/issues>
 
 =item * Search CPAN
 
@@ -416,7 +459,8 @@ L<http://search.cpan.org/dist/Try-Tiny-SmartCatch/>
 
 =head1 ACKNOWLEDGEMENTS
 
-Yuval Kogman for his L<Try::Tiny> module :)
+Yuval Kogman for his L<Try::Tiny> module
+mst - Matt S Trout (cpan:MSTROUT) <mst@shadowcat.co.uk> - for good package name and few great features
 
 =head1 LICENSE AND COPYRIGHT
 
