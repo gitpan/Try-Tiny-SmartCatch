@@ -21,4 +21,4 @@ requires:
   Test::More: 0
 resources:
   repository: https://github.com/mysz/try-tiny-smartcatch
-version: 0.4
+version: 0.5
