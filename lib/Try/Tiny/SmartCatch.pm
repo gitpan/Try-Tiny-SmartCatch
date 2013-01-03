@@ -4,18 +4,263 @@ use 5.006;
 use strict;
 use warnings;
 
-use Scalar::Util qw/ blessed /;
-
-use vars qw(@EXPORT @EXPORT_OK $VERSION @ISA);
+use vars qw/@EXPORT @EXPORT_OK %EXPORT_TAGS $VERSION @ISA/;
 
 BEGIN {
     require Exporter;
-    @ISA = qw(Exporter);
+    @ISA = qw/Exporter/;
 }
 
-@EXPORT = @EXPORT_OK = qw(try catch_when catch_default then finally);
+@EXPORT = qw/try catch_when catch_default then finally/;
+@EXPORT_OK = (@EXPORT, qw/throw/);
+%EXPORT_TAGS = (
+    all => [@EXPORT_OK],
+);
 
-$Carp::Internal{+__PACKAGE__}++;
+++$Carp::Internal{+__PACKAGE__};
+
+$VERSION = '0.4';
+
+sub try($;@) {
+    my ($try, @code_refs) = @_;
+
+    my ($catch_default, @catch_when, $code_ref, @finally, $ref_type, $then, $wantarray);
+
+    $wantarray = wantarray ();
+
+    foreach $code_ref (@code_refs) {
+        next if (!$code_ref);
+
+        $ref_type = ref($code_ref);
+
+        ## zero or more 'catch_when' blocks
+        if ($ref_type eq 'Try::Tiny::SmartCatch::Catch::When') {
+            ## we need to save same handler for many different exception types
+            push(@catch_when, $code_ref);
+        }
+        ## zero or one 'catch_default' blocks
+        elsif ($ref_type eq 'Try::Tiny::SmartCatch::Catch::Default') {
+            $catch_default = $$code_ref{code}
+                if (!defined($catch_default));
+        }
+        ## zero or more 'finally' blocks
+        elsif ($ref_type eq 'Try::Tiny::SmartCatch::Finally') {
+            push(@finally, $$code_ref);
+        }
+        ## zero or one 'then' blocks
+        elsif ($ref_type eq 'Try::Tiny::SmartCatch::Then') {
+            $then = $$code_ref
+                if (!defined($then));
+        }
+        ## unknown block type
+        else {
+            require Carp;
+            Carp::confess("Unknown code ref type given '$ref_type'. Check your usage & try again");
+        }
+    }
+
+    my ($error, $failed, $prev_error, @ret);
+
+    ## save the value of $@ so we can set $@ back to it in the beginning of the eval
+    $prev_error = $@;
+
+    {
+        ## localize $@ to prevent clobbering of previous value by a successful eval.
+        local $@;
+
+        ## failed will be true if the eval dies, because 1 will not be returned from the eval body
+        $failed = not eval {
+            $@ = $prev_error;
+
+            ## call try block in list context if try subroutine is called in list context, or we have 'then' block
+            ## result of 'try' block is passed as arguments to then block, so we need do that in that way
+            if ($wantarray || $then) {
+                @ret = &$try();
+            }
+            elsif (defined($wantarray)) {
+                $ret[0] = &$try();
+            }
+            else {
+                &$try();
+            }
+
+            ## properly set $fail to false
+            return 1;
+        };
+
+        ## copy $@ to $error; when we leave this scope, local $@ will revert $@
+        ## back to its previous value
+        $error = $@;
+    }
+
+    ## set up a scope guard to invoke the finally block at the end
+    my @guards = (
+        map {
+            Try::Tiny::SmartCatch::ScopeGuard->_new($_, $failed ? $error : ())
+        } @finally
+    );
+
+    ## at this point $failed contains a true value if the eval died, even if some
+    ## destructor overwrote $@ as the eval was unwinding.
+    if ($failed) {
+        ## if we got an error, invoke the catch block.
+        if (scalar(@catch_when) || $catch_default) {
+
+            ## This works like given($error), but is backwards compatible and
+            ## sets $_ in the dynamic scope for the body of $catch
+            for ($error) {
+                my ($catch_data);
+                foreach $catch_data (@catch_when) {
+                    return &{$$catch_data{code}}($error)
+                        if ($catch_data->for_error($error));
+                }
+
+                return &$catch_default($error)
+                    if ($catch_default);
+
+                die($error);
+            }
+        }
+
+        return;
+    }
+
+    ## no failure, $@ is back to what it was, everything is fine
+    else {
+        ## do we have then block? if we does, execute it in correct context
+        if ($then) {
+            if ($wantarray) {
+                @ret = &$then(@ret);
+            }
+            elsif (defined($wantarray)) {
+                $ret[0] = &$then(@ret);
+            }
+            else {
+                &$then(@ret);
+            }
+        }
+
+        return if (!defined($wantarray));
+        return $wantarray ? @ret : $ret[0];
+    }
+}
+
+sub catch_when ($$;@) {
+    my ($types, $block) = (shift(@_), shift(@_));
+
+    my $catch = Try::Tiny::SmartCatch::Catch::When->new($block, $types);
+
+    return ($catch, @_);
+}
+
+sub catch_default ($;@) {
+    my $block = shift(@_);
+
+    my $catch = Try::Tiny::SmartCatch::Catch::Default->new($block);
+
+    return ($catch, @_);
+}
+
+sub then ($;@) {
+    my $block = shift(@_);
+
+    my $then = bless(\$block, 'Try::Tiny::SmartCatch::Then');
+
+    return ($then, @_);
+}
+
+sub finally ($;@) {
+    my $block = shift(@_);
+
+    my $finally = bless(\$block, 'Try::Tiny::SmartCatch::Finally');
+
+    return ($finally, @_);
+}
+
+sub throw {
+    return die (@_);
+}
+
+package # hide from PAUSE
+    Try::Tiny::SmartCatch::ScopeGuard;
+{
+
+    sub _new {
+        shift(@_);
+        return bless([ @_ ]);
+    }
+
+    sub DESTROY {
+        my ($guts) = @_;
+
+        my $code = shift(@$guts);
+        return &$code(@$guts);
+    }
+}
+
+package Try::Tiny::SmartCatch::Catch::Default;
+{
+    sub new {
+        my ($class, $code) = @_;
+
+        my $self = { code => $code };
+        $self    = bless($self, $class);
+
+        return $self;
+    }
+}
+
+package Try::Tiny::SmartCatch::Catch::When;
+{
+    use Scalar::Util qw/blessed/;
+
+    sub new {
+        my ($class, $code, $types) = @_;
+
+        my $self = {
+            code  => $code,
+            types => (
+                ref($types) eq 'ARRAY' ? $types   :
+                defined($types)        ? [$types] :
+                                         []
+            ),
+        };
+
+        return bless($self, $class);
+    }
+
+    sub for_error {
+        my ($self, $error, $types) = @_;
+
+        $types = $$self{types}
+            if (!defined($types));
+        $types = [$types]
+            if (ref($types) ne 'ARRAY');
+
+        if (blessed($error)) {
+            foreach (@$types) {
+                return 1 if ($error->isa($_));
+            }
+        }
+        else {
+            my $type;
+            foreach $type (@$types) {
+                return 1 if (
+                    (ref($type) eq 'Regexp' && $error =~ /$type/) ||
+                    (!ref($type) && index($error, $type) > -1)
+                );
+            }
+        }
+
+        return;
+    }
+
+}
+
+
+1;
+
+__END__
 
 =head1 NAME
 
@@ -23,91 +268,109 @@ Try::Tiny::SmartCatch - lightweight Perl module for powerful exceptions handling
 
 =head1 VERSION
 
-Version 0.3
-
-=cut
-
-$VERSION = '0.3';
+Version 0.4
 
 =head1 SYNOPSIS
 
     use Try::Tiny::SmartCatch;
 
-    # call some code and just silence errors:
-    try sub {
-        # some code which my die
-    };
-
-    # call some code with expanded error handling (throw exceptions as object)
-    try sub {
-        die (Exception1->new ('some error'));
-    },
-    catch_when 'Exception1' => sub {
-        # handle Exception1 exception
-    },
-    catch_when ['Exception2', 'Exception3'] => sub {
-        # handle Exception2 or Exception3 exception
-    },
-    catch_default sub {
-        # handle all other exceptions
-    },
-    finally sub {
-        # and finally run some other code
-    };
-
-    # call some code with expanded error handling (throw exceptions as strings)
-    try sub {
-        die ('some error1');
-    },
-    catch_when 'error1' => sub {
-        # search for 'error1' in message
-    },
-    catch_when qr/error\d/ => sub {
-        # search exceptions matching message to regexp
-    },
-    catch_when ['error2', qr/error\d/'] => sub {
-        # search for 'error2' or match 'error\d in message
-    },
-    catch_default sub {
-        # handle all other exceptions
-    },
-    finally sub {
-        # and finally run some other code
-    };
-
-    # try some code, and execute the other if it pass
-    try sub {
-        say 'some code';
-        return 'Hello, world!';
-    },
-    catch_default sub {
-        say 'some exception caught: ', $_;
-    },
-    then sub {
-        say 'all passed, no exceptions found. Message from try block: ' . $_[0];
-    };
+    try sub {}, # at least one try block
+    catch_when 'ExceptionName' => sub {}, # zero or more catch_when blocks
+    catch_when 'exception message' => sub {},
+    catch_when qr/exception  message regexp/ => sub {},
+    catch_default sub {}, # zero or one catch_default block
+    then sub {}, # if no exception is raised, execute then block
+    finally sub {}; #zero or more finally blocks
+    
+    use Try::Tiny::SmartCatch qw/throw/; # import only throw
+    # You can import also all function at once:
+    # use Try::Tiny::SmartCatch qw/:all/;
+    throw('some exception');
+    throw(SomeException->new ('message'));
 
 =head1 DESCRIPTION
 
-C<Try::Tiny::SmartCatch> is a simple way to handle exceptions. It's mostly a copy
-of C<Try::Tiny> module by Yuval Kogman, but with some additional features I need.
+Goals are mostly the same as L<Try::Tiny> module, but there are few changes
+to it's specification. Main difference is possibility to catch just some kinds
+of exceptions in place of catching everything. Another one is slightly changed
+syntax.
 
-Main goal for this changes is to add ability to catch B<only desired> exceptions.
-Additionally, it uses B<no more anonymous subroutines> - there are public sub's definitions.
-This gave you less chances to forgot that C<return> statement exits just from exception
-handler, not surrounding function call.
+When raised exception is an object, L<Try::Tiny::SmartCatch> will test for
+exception type (using C<UNIVERSAL::isa>). When raised exception is just
+a text message (like: C<die ('message')>), there can be specified part of
+message to test for.
 
-If you want to read about other assumptions, read about our predecessor: L<Try::Tiny>.
+There are also explicit C<sub> blocks. In opposite to C<Try::Tiny>,
+every block in C<Try::Tiny::SmartCatch>: C<try>, C<catch_when>, C<catch_default>,
+C<then> and C<finally> must have explicit subroutines specified. Thanks to trick
+with function prototype, calling C<Try::Tiny::try> or C<Try::Tiny::catch>
+creates implicit subroutines:
 
-More documentation for C<Try::Tiny::SmartCatch> is at package home: L<http://github.com/mysz/try-tiny-smartcatch>
+    sub test_function {
+        try {
+            # yes, here is implicit subroutine!
+            # return statement here exits just from try block,
+            # not from test_function!
+            return 1;
+        };
+    
+        say 'Hello!';
+    }
+    
+    test_function();
+
+Above snippet produces us text on STDOUT: C<Hello!>
+
+But more obvious would be no output... (by C<return> statement). This is because of
+implicit subroutine created with braces: C<{}> after C<try>,
+ C<catch> or C<finally> from C<Try::Tiny>. C<Try::Tiny::SmartCatch> is
+more explicit - you must always use C<sub> when defining blocks (look
+at [Syntax](#Syntax) above).
+
+An exception object or message is passed to defined blocks in two ways:
+* in C<$_> variable
+* as function arguments, so through C<@_> array.
+
+L<Try::Tiny::SmartCatch> defines also C<throw> function (not imported
+by default). Currently it is an alias for C<die>, but is more explicit then C<die> :)
+
+It can be imported separately:
+
+    use Try::Tiny::SmartCatch qw/throw/;
+
+Or with rest of functions:
+
+    use Try::Tiny::SmartCatch qw/:all/;
 
 =head1 EXPORT
 
-All functions are exported by default using L<Exporter>.
+By default exported are functions:
+
+=over
+
+=item try
+
+=item catch_when
+
+=item catch_default
+
+=item then
+
+=item finally
+
+=back
+
+You can also explicit import C<throw> function:
+
+    use Try::Tiny::SmartCatch qw/throw/;
+
+Or all functions at all:
+
+    use Try::Tiny::SmartCatch qw/:all/;
 
 =head1 SUBROUTINES/METHODS
 
-=head2 try ($;@)
+=head2 try($;@)
 
 Works like L<Try::Tiny> C<try> subroutine, here is nothing to add :)
 
@@ -117,119 +380,7 @@ The only difference is that here must be given evident sub reference, not anonym
         # some code
     };
 
-=cut
-
-sub try ($;@) {
-    my ( $try, @code_refs ) = @_;
-
-    my ( @catch_when, $catch_default, $then, @finally );
-
-    # find labeled blocks in the argument list.
-    # catch and finally tag the blocks by blessing a scalar reference to them.
-    foreach my $code_ref (@code_refs) {
-        next if (!$code_ref);
-
-        my $ref = ref ($code_ref);
-
-        if ($ref eq 'Try::Tiny::SmartCatch::Catch::When') {
-            push (@catch_when, map { [ $_, $$code_ref{code}, ] } (@{$code_ref->get_types}));
-        }
-        elsif ($ref eq 'Try::Tiny::SmartCatch::Catch::Default') {
-            $catch_default = $$code_ref{code}
-                if (!defined ($catch_default));
-        }
-        elsif ($ref eq 'Try::Tiny::SmartCatch::Finally') {
-            push (@finally, ${$code_ref});
-        }
-        elsif ($ref eq 'Try::Tiny::SmartCatch::Then') {
-            $then = ${$code_ref}
-                if (!defined ($then));
-        }
-        else {
-            require Carp;
-            Carp::confess ("Unknown code ref type given '${ref}'. Check your usage & try again");
-        }
-    }
-
-    # save the value of $@ so we can set $@ back to it in the beginning of the eval
-    my $prev_error = $@;
-
-    my ( @ret, $error, $failed );
-
-    # FIXME consider using local $SIG{__DIE__} to accumulate all errors. It's
-    # not perfect, but we could provide a list of additional errors for
-    # $catch->();
-
-    {
-        # localize $@ to prevent clobbering of previous value by a successful
-        # eval.
-        local $@;
-
-        # failed will be true if the eval dies, because 1 will not be returned
-        # from the eval body
-        $failed = not eval {
-            $@ = $prev_error;
-
-            @ret = $try->();
-
-            return 1; # properly set $fail to false
-        };
-
-        # copy $@ to $error; when we leave this scope, local $@ will revert $@
-        # back to its previous value
-        $error = $@;
-    }
-
-    # set up a scope guard to invoke the finally block at the end
-    my @guards =
-        map { Try::Tiny::SmartCatch::ScopeGuard->_new ($_, $failed ? $error : ()) }
-        @finally;
-
-    # at this point $failed contains a true value if the eval died, even if some
-    # destructor overwrote $@ as the eval was unwinding.
-    if ($failed) {
-        # if we got an error, invoke the catch block.
-        if (scalar (@catch_when) || $catch_default) {
-            my ($catch_data, );
-
-            # This works like given($error), but is backwards compatible and
-            # sets $_ in the dynamic scope for the body of C<$catch>
-            for ($error) {
-                foreach $catch_data (@catch_when) {
-                    if (
-                        (blessed ($error) && $error->isa ($$catch_data[0])) ||
-                        (!blessed ($error) && (
-                            (ref ($$catch_data[0]) eq 'Regexp' && $error =~ /$$catch_data[0]/) ||
-                            (!ref ($$catch_data[0]) && index ($error, $$catch_data[0]) > -1)
-                        ))
-                    ) {
-                        return &{$$catch_data[1]} ($error);
-                    }
-                }
-
-                if ($catch_default) {
-                    return &$catch_default ($error);
-                }
-
-                die ($error);
-            }
-
-            # in case when() was used without an explicit return, the C<for>
-            # loop will be aborted and there's no useful return value
-        }
-
-        return;
-    }
-    else {
-        @ret = $then->(@ret)
-            if ($then);
-
-        # no failure, $@ is back to what it was, everything is fine
-        return wantarray ? @ret : $ret[0];
-    }
-}
-
-=head2 catch_when ($$;@)
+=head2 catch_when($$;@)
 
 Intended to be used in the second argument position of C<try>.
 
@@ -251,7 +402,7 @@ string in exception message (using C<index> function or regular expressions - de
 type of given operator). For example:
 
     try sub {
-        die ('some exception message');
+        throw('some exception message');
     },
     catch_when 'exception' => sub {
         say 'exception caught!';
@@ -260,7 +411,7 @@ type of given operator). For example:
 Other case:
 
     try sub {
-        die ('some exception3 message');
+        throw('some exception3 message');
     },
     catch_when qr/exception\d/ => sub {
         say 'exception caught!';
@@ -270,22 +421,13 @@ Or:
 
     try sub {
         # ValueError extends RuntimeError
-        die (ValueError->new ('Some error message'));
+        throw(ValueError->new ('Some error message'));
     },
     catch_when 'RuntimeError' => sub {
         say 'RuntimeError exception caught!';
     };
 
-=cut
-
-sub catch_when ($$;@) {
-    my ($types, $block, ) = (shift (@_), shift (@_), );
-
-    my $catch = Try::Tiny::SmartCatch::Catch::When->new ($block, $types);
-    return $catch, @_;
-}
-
-=head2 catch_default ($;@)
+=head2 catch_default($;@)
 
 Works exactly like L<Try::Tiny> C<catch> function (OK, there is difference:
 need to specify evident sub block instead of anonymous block):
@@ -297,20 +439,11 @@ need to specify evident sub block instead of anonymous block):
         say 'caught every exception';
     };
 
-=cut
-
-sub catch_default ($;@) {
-    my ($block, ) = shift (@_);
-
-    my $catch = Try::Tiny::SmartCatch::Catch::Default->new ($block);
-    return $catch, @_;
-}
-
-=head2 then ($;@)
+=head2 then($;@)
 
 C<then> block is executed after C<try> clause, if none of C<catch_when> or
 C<catch_default> blocks was executed (it means, if no exception occured).
-It;s executed before C<finally> blocks.
+It's executed before C<finally> blocks.
 
     try sub {
         # some code
@@ -325,18 +458,7 @@ It;s executed before C<finally> blocks.
         say 'executed always';
     };
 
-=cut
-
-sub then ($;@) {
-    my ($block, @rest, ) = @_;
-
-    return (
-        bless (\$block, 'Try::Tiny::SmartCatch::Then'),
-        @rest
-    );
-}
-
-=head2 finally ($;@)
+=head2 finally($;@)
 
 Works exactly like L<Try::Tiny> C<finally> function (OK, again, explicit sub
 instead of implicit):
@@ -348,63 +470,13 @@ instead of implicit):
         say 'executed always';
     };
 
-=cut
+=head2 throw
 
-sub finally ($;@) {
-    my ($block, @rest, ) = @_;
+Currently it's an alias to C<die> function, but C<throw> is more obvious then C<die> when working with exceptions :)
 
-    return (
-        bless (\$block, 'Try::Tiny::SmartCatch::Finally'),
-        @rest,
-    );
-}
+In future it also can do more then just call C<die>.
 
-package # hide from PAUSE
-    Try::Tiny::SmartCatch::ScopeGuard;
-{
-
-    sub _new {
-        shift;
-        bless [ @_ ];
-    }
-
-    sub DESTROY {
-        my @guts = @{ shift () };
-        my $code = shift (@guts);
-        $code->(@guts);
-    }
-}
-
-package Try::Tiny::SmartCatch::Catch::Default;
-{
-    sub new {
-        my $self = {};
-        $self = bless ($self, $_[0]);
-        $$self{code} = $_[1];
-        return $self;
-    }
-}
-
-package Try::Tiny::SmartCatch::Catch::When;
-{
-    sub new {
-        my $self = {};
-        $self = bless ($self, $_[0]);
-        $$self{code} = $_[1];
-        $self->set_types ($_[2]) if (defined ($_[2]));
-        return $self;
-    }
-
-    sub set_types {
-        my ($self, $types, ) = @_;
-        $$self{types} = ref ($types) eq 'ARRAY' ? $types : [$types, ];
-    }
-
-    sub get_types {
-        my ($self, ) = @_;
-        return wantarray ? @{defined ($$self{types}) ? $$self{types} : []} : $$self{types};
-    }
-}
+It's not exported by default (see: L</EXPORT>)
 
 =head1 SEE ALSO
 
@@ -459,12 +531,21 @@ L<http://search.cpan.org/dist/Try-Tiny-SmartCatch/>
 
 =head1 ACKNOWLEDGEMENTS
 
-Yuval Kogman for his L<Try::Tiny> module
-mst - Matt S Trout (cpan:MSTROUT) <mst@shadowcat.co.uk> - for good package name and few great features
+=over
+
+=item Yuval Kogman
+
+for his L<Try::Tiny> module
+
+=item mst - Matt S Trout (cpan:MSTROUT) <mst@shadowcat.co.uk>
+
+for good package name and few great features
+
+=back
 
 =head1 LICENSE AND COPYRIGHT
 
-    Copyright (c) 2012 Marcin Sztolcman. All rights reserved.
+    Copyright (c) 2012-2013 Marcin Sztolcman. All rights reserved.
 
     Base code is borrowed from Yuval Kogman L<Try::Tiny> module,
     released under MIT License.
@@ -473,5 +554,3 @@ mst - Matt S Trout (cpan:MSTROUT) <mst@shadowcat.co.uk> - for good package name 
     it and/or modify it under the terms of the MIT license.
 
 =cut
-
-1;
